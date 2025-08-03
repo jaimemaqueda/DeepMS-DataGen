@@ -1,6 +1,6 @@
 # DeepMS-DataGen: Synthetic Dataset Generator for Machining Process Sequencing
 
-This project features a Python-based FreeCAD macro designed to generate synthetic datasets of 3D manufacturing parts and their operation sequences. This dataset generator was developed to support the research presented in the paper ["A data-driven approach to machining process sequencing using transformers"](https://doi.org/10.1016/j.jmsy.2025.07.022). The tool automates the creation of voxelized representations of parts while tracking material removal at each machining step to support the training of the DeepMS framework described in the paper.
+This project features a Python-based FreeCAD macro designed to generate synthetic datasets of 3D manufacturing parts and their operation sequences. This dataset generator was developed to support the research presented in the paper ["DeepMS: A data-driven approach to machining process sequencing using transformers"](https://doi.org/10.1016/j.jmsy.2025.07.022). The tool automates the creation of voxelized representations of parts while tracking material removal at each machining step to support the training of the DeepMS framework described in the paper.
 
 The generated dataset includes:
 
