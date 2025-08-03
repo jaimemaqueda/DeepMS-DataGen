@@ -1,0 +1,748 @@
+import numpy as np
+from collections import OrderedDict
+import random
+import gc
+import sys
+import ptvsd
+from scripts import PartCreator, VoxelConverter, SurfaceMap
+from scripts import get_next_filenames, get_next_stl_filename, select_feature_combinations
+from scripts.macro import *
+import csv
+
+def main(csv_writer):
+    global num_samples, sample
+    # List with possible combinations of features
+    combinations = [
+        ([MILL_IDX, SLANT_IDX, DRILL_IDX], "No Intersection"),
+        ([MILL_IDX, SLANT_IDX], "No Intersection"),
+        ([MILL_IDX, DRILL_IDX], "No Intersection"),
+        ([SLANT_IDX, DRILL_IDX], "No Intersection"),
+        ([MILL_IDX], "No Intersection"),
+        ([SLANT_IDX], "No Intersection"),
+        ([DRILL_IDX], "No Intersection"),
+        ([SLANT_IDX, MILL_IDX, DRILL_IDX], "Intersection Mill-Slant"),
+        ([SLANT_IDX, MILL_IDX], "Intersection Mill-Slant"),
+        ([MILL_IDX, DRILL_IDX, SLANT_IDX], "Intersection Drill-Slant"),
+        ([DRILL_IDX, SLANT_IDX], "Intersection Drill-Slant"),
+        ([DRILL_IDX, MILL_IDX, SLANT_IDX], "Intersection Mill-Drill"),
+        ([DRILL_IDX, MILL_IDX], "Intersection Mill-Drill"),
+        ([DRILL_IDX, SLANT_IDX, MILL_IDX], "Intersection Mill-Drill Mill-Slant Drill-Slant"),
+        ([SLANT_IDX, DRILL_IDX, MILL_IDX], "Intersection Mill-Drill Mill-Slant"),
+    ]
+
+    # Obtain the next file paths for the HDF5 and STL files
+    base_h5_dir = 'C:/Users/jgomez310/Documents/data_deepms/seq_h5'
+    base_stl_dir = 'C:/Users/jgomez310/Documents/data_deepms/seq_stl'
+    h5_file_path, stl_file_path = get_next_filenames(base_h5_dir, base_stl_dir, max_files_per_folder=3000)
+
+    # Initialize the PartCreator with the current document
+    part = PartCreator()
+    voxelizer = VoxelConverter(filename=h5_file_path, stl_filename=stl_file_path, voxel_resolution=np.array([VOL_DIM, VOL_DIM, VOL_DIM]))
+
+    # Create raw stock with random dimensions
+    length = random.randint(100, 128)
+    width = random.randint(100, 128)
+    height = random.randint(50, 80)
+    part.create_raw_stock(length, width, height)
+    part.save_as_stl(stl_file_path)
+    voxelizer.convert_to_voxels(stl_file_path, operation=RS_IDX)
+
+    # Initialize the occupancy maps (grids representing the top surface of the raw stock)
+    occupancy_drilling = SurfaceMap(length, width)
+    occupancy_milling = SurfaceMap(length, width)
+    occupancy_slant = SurfaceMap(length, width)
+    occupancy_depth = SurfaceMap(length, width, dtype=int)
+
+    # Initialize the lists for the features. Each feature is represented by a tuple with the following elements:
+    # (feature index, feature parameters, feature volume)
+    slant_list = []
+    mill_list = []
+    drill_list = []
+    feature_list = []
+    flag_mill_1 = False # Flag for the milling feature that doesn't intersect other milling features
+    flag_mill_2 = False # Flag for the nesting milling feature that nests another milling feature
+    flag_mill_3 = False # Flag for the nested milling feature that is nested by another milling feature
+    flag_mill_4 = False # Flag for the abut milling feature that abut the nesting milling feature
+
+    D = random.randint(2, MAX_N_DRILL)
+    M = random.randint(2, MAX_N_MILL)
+    create_first_type_first = random.choice([True, False]) # For later deciding the order of the milling operation
+
+    # Place the features based on the selected combination of types of operations
+    combination, case = select_feature_combinations()
+    print(f"Sample: {sample}, Combination: {combination}, Case: {case}")
+
+    # Place the slant feature first with its corresponding intersecting features
+    if SLANT_IDX in combination:
+        directions = ['left', 'right', 'top', 'bottom']
+        direction = random.choice(directions)
+        size_slant = random.randint(15, 30)
+        height_slant = random.randint(15, 30)
+        volume_slant = 0.5 * size_slant * height_slant * width if direction in ['left', 'right'] else 0.5 * size_slant * height_slant * length
+        slant_list.append((SLANT_IDX, (direction, size_slant, height_slant), volume_slant))
+
+        if direction == 'left':
+            occupancy_slant.grid[0:size_slant, :] = True
+            for i in range(size_slant):
+                occupancy_depth.grid[i, :] = int(np.ceil(height_slant - i * (height_slant / size_slant)))
+
+            if case not in ["Intersection Drill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant", "Intersection Mill-Drill"]:
+                occupancy_drilling.grid[0:size_slant, :] = True
+
+            elif case != "Intersection Mill-Drill":
+                diameter_drill = random.randint(8, size_slant - 6)
+                length_drill = diameter_drill + 6
+                width_drill = diameter_drill + 6
+                rectification_x = random.randint(0, size_slant - length_drill)
+                rectification_y = random.randint(0, width - width_drill)
+                x_drill = - length/2 + length_drill/2 + rectification_x
+                y_drill = - width/2 + width_drill/2 + rectification_y
+                depth_drill = random.randint(height_slant + 5, height)
+                volume_drill = 0.25 * np.pi * diameter_drill * diameter_drill * depth_drill
+                occupancy_depth.grid[rectification_x+3:rectification_x+length_drill-3, rectification_y+3:rectification_y+width_drill-3] = depth_drill
+                occupancy_drilling.grid[rectification_x:rectification_x+length_drill, rectification_y:rectification_y+width_drill] = True
+
+                drill_list.append((DRILL_IDX, (diameter_drill, depth_drill, x_drill, y_drill), volume_drill))
+                D -= 1
+
+            if case not in ["Intersection Mill-Slant", "Intersection Mill-Drill Mill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant"]:
+                occupancy_milling.grid[0:size_slant, :] = True
+
+            else:
+                length_mill = random.randint(size_slant, int(0.5 * length))
+                width_mill = random.randint(10, int(0.5 * width))
+                rectification_x = 0
+                rectification_y = random.randint(5, width - width_mill - 5)
+                max_depth = np.max(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill]) - 5
+                if max_depth < height_slant: max_depth = height
+                depth_mill = random.randint(height_slant, max_depth)
+                volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=0, a_max=depth_mill))
+                x_mill = - length/2 + length_mill/2 + rectification_x
+                y_mill = - width/2 + width_mill/2 + rectification_y
+                occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=depth_mill, a_max=None)
+                occupancy_milling.grid[rectification_x:rectification_x+length_mill+5, rectification_y-5:rectification_y+width_mill+5] = True
+                if case == "Intersection Mill-Slant":
+                    occupancy_drilling.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = True
+
+                mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                M -= 1
+                flag_mill_1 = True
+
+        elif direction == 'right':
+            occupancy_slant.grid[-size_slant:, :] = True
+            for i in range(size_slant):
+                occupancy_depth.grid[-i-1, :] = int(np.ceil(height_slant - i * (height_slant / size_slant)))
+
+            if case not in ["Intersection Drill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant", "Intersection Mill-Drill"]:
+                occupancy_drilling.grid[-size_slant:, :] = True
+
+            elif case != "Intersection Mill-Drill":
+                diameter_drill = random.randint(8, size_slant - 6)
+                length_drill = diameter_drill + 6
+                width_drill = diameter_drill + 6
+                rectification_x = random.randint(length - size_slant, length - length_drill)
+                rectification_y = random.randint(0, width - width_drill)
+                x_drill = - length/2 + length_drill/2 + rectification_x
+                y_drill = - width/2 + width_drill/2 + rectification_y
+                depth_drill = random.randint(height_slant + 5, height)
+                volume_drill = 0.25 * np.pi * diameter_drill * diameter_drill * depth_drill
+                occupancy_depth.grid[rectification_x+3:rectification_x+length_drill-3, rectification_y+3:rectification_y+width_drill-3] = depth_drill
+                occupancy_drilling.grid[rectification_x:rectification_x+length_drill, rectification_y:rectification_y+width_drill] = True
+
+                drill_list.append((DRILL_IDX, (diameter_drill, depth_drill, x_drill, y_drill), volume_drill))
+                D -= 1
+
+            if case not in ["Intersection Mill-Slant", "Intersection Mill-Drill Mill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant"]:
+                occupancy_milling.grid[-size_slant:, :] = True
+
+            else:
+                length_mill = random.randint(size_slant, int(0.5 * length))
+                width_mill = random.randint(10, int(0.5 * width))
+                rectification_x = length - length_mill
+                rectification_y = random.randint(5, width - width_mill - 5)
+                max_depth = np.max(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill]) - 5
+                if max_depth < height_slant: max_depth = height
+                depth_mill = random.randint(height_slant, max_depth)
+                volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=depth_mill, a_max=None))
+                x_mill = - length/2 + length_mill/2 + rectification_x
+                y_mill = - width/2 + width_mill/2 + rectification_y
+                occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=depth_mill, a_max=None)
+                occupancy_milling.grid[rectification_x-5:rectification_x+length_mill, rectification_y-5:rectification_y+width_mill+5] = True
+                if case == "Intersection Mill-Slant":
+                    occupancy_drilling.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = True
+
+                mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                M -= 1
+                flag_mill_1 = True
+
+        elif direction == 'top':
+            occupancy_slant.grid[:, -size_slant:] = True
+            for j in range(size_slant):
+                occupancy_depth.grid[:, -j-1] = int(np.ceil(height_slant - j * (height_slant / size_slant)))
+
+            if case not in ["Intersection Drill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant", "Intersection Mill-Drill"]:
+                occupancy_drilling.grid[:, -size_slant:] = True
+
+            elif case != "Intersection Mill-Drill":
+                diameter_drill = random.randint(8, size_slant - 6)
+                length_drill = diameter_drill + 6
+                width_drill = diameter_drill + 6
+                rectification_x = random.randint(0, length - length_drill)
+                rectification_y = random.randint(width - size_slant, width - width_drill)
+                x_drill = - length/2 + length_drill/2 + rectification_x
+                y_drill = - width/2 + width_drill/2 + rectification_y
+                depth_drill = random.randint(height_slant + 5, height)
+                volume_drill = 0.25 * np.pi * diameter_drill * diameter_drill * depth_drill
+                occupancy_depth.grid[rectification_x+3:rectification_x+length_drill-3, rectification_y+3:rectification_y+width_drill-3] = depth_drill
+                occupancy_drilling.grid[rectification_x:rectification_x+length_drill, rectification_y:rectification_y+width_drill] = True
+
+                drill_list.append((DRILL_IDX, (diameter_drill, depth_drill, x_drill, y_drill), volume_drill))
+                D -= 1
+
+            if case not in ["Intersection Mill-Slant", "Intersection Mill-Drill Mill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant"]:
+                occupancy_milling.grid[:, -size_slant:] = True
+
+            else:
+                length_mill = random.randint(10, int(0.5 * length))
+                width_mill = random.randint(size_slant, int(0.5 * width))
+                rectification_x = random.randint(5, length - length_mill - 5)
+                rectification_y = width - width_mill
+                max_depth = np.max(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill]) - 5
+                if max_depth < height_slant: max_depth = height
+                depth_mill = random.randint(height_slant, max_depth)
+                volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=0, a_max=depth_mill))
+                x_mill = - length/2 + length_mill/2 + rectification_x
+                y_mill = - width/2 + width_mill/2 + rectification_y
+                occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=depth_mill, a_max=None)
+                occupancy_milling.grid[rectification_x-5:rectification_x+length_mill+5, rectification_y-5:rectification_y+width_mill] = True
+                if case == "Intersection Mill-Slant":
+                    occupancy_drilling.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = True
+
+                mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                M -= 1
+                flag_mill_1 = True
+
+        elif direction == 'bottom':
+            occupancy_slant.grid[:, 0:size_slant] = True
+            for j in range(size_slant):
+                occupancy_depth.grid[:, j] = int(np.ceil(height_slant - j * (height_slant / size_slant)))
+
+            if case not in ["Intersection Drill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant", "Intersection Mill-Drill"]:
+                occupancy_drilling.grid[:, 0:size_slant] = True
+
+            elif case != "Intersection Mill-Drill":
+                diameter_drill = random.randint(8, size_slant - 6)
+                length_drill = diameter_drill + 6
+                width_drill = diameter_drill + 6
+                rectification_x = random.randint(0, length - length_drill)
+                rectification_y = random.randint(0, size_slant - width_drill)
+                x_drill = - length/2 + length_drill/2 + rectification_x
+                y_drill = - width/2 + width_drill/2 + rectification_y
+                depth_drill = random.randint(height_slant + 5, height)
+                volume_drill = 0.25 * np.pi * diameter_drill * diameter_drill * depth_drill
+                occupancy_depth.grid[rectification_x+3:rectification_x+length_drill-3, rectification_y+3:rectification_y+width_drill-3] = depth_drill
+                occupancy_drilling.grid[rectification_x:rectification_x+length_drill, rectification_y:rectification_y+width_drill] = True
+
+                drill_list.append((DRILL_IDX, (diameter_drill, depth_drill, x_drill, y_drill), volume_drill))
+                D -= 1
+
+            if case not in ["Intersection Mill-Slant", "Intersection Mill-Drill Mill-Slant", "Intersection Mill-Drill Mill-Slant Drill-Slant"]:
+                occupancy_milling.grid[:, 0:size_slant] = True
+
+            else:
+                length_mill = random.randint(10, int(0.5 * length))
+                width_mill = random.randint(size_slant, int(0.5 * width))
+                rectification_x = random.randint(5, length - length_mill -5)
+                rectification_y = 0
+                max_depth = np.max(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill]) - 5
+                if max_depth < height_slant: max_depth = height
+                depth_mill = random.randint(height_slant, max_depth)
+                volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=0, a_max=depth_mill))
+                x_mill = - length/2 + length_mill/2 + rectification_x
+                y_mill = - width/2 + width_mill/2 + rectification_y
+                occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = np.clip(occupancy_depth.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill], a_min=depth_mill, a_max=None)
+                occupancy_milling.grid[rectification_x-5:rectification_x+length_mill+5, rectification_y:rectification_y+width_mill+5] = True
+                if case == "Intersection Mill-Slant":
+                    occupancy_drilling.grid[rectification_x:rectification_x+length_mill, rectification_y:rectification_y+width_mill] = True
+
+                mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                M -= 1
+                flag_mill_1 = True
+
+
+    for operation in combination:
+
+        if operation == SLANT_IDX:
+            
+            feature_list.extend(slant_list)
+
+        if operation == DRILL_IDX:
+            
+            # Ensure that a drill is created inside a milling feature in the corresponding cases
+            if case == "Intersection Mill-Drill Mill-Slant" or case == "Intersection Mill-Drill Mill-Slant Drill-Slant" or case == "Intersection Mill-Drill":
+                # Place nesting milling feature (flag_mill_2)
+                while True: # Iterate over the coordinates to find a suitable location for the drill
+                    length_mill = random.randint(30, int(0.7*length))
+                    width_mill = random.randint(30, int(0.7*width))
+                    rectification_x = random.choice([0, length - length_mill, *range(5, length - length_mill - 5 + 1)]) # Prevent from creating thin edges
+                    rectification_y = random.choice([0, width - width_mill, *range(5, width - width_mill - 5 + 1)]) # Prevent from creating thin edges
+
+                    # Leave space for the other milling features
+                    if case == "Intersection Mill-Drill" and (M > 2 or (M == 2 and not create_first_type_first)):
+                        if len(slant_list) > 0:
+                            if (slant_list[0][1][0] in ["left", "right"] and (length - length_mill - slant_list[0][1][1] < 40) and (width - width_mill < 40)) or \
+                                (slant_list[0][1][0] in ["top", "bottom"] and (width - width_mill - slant_list[0][1][1] < 40) and (length - length_mill < 40)):
+                                continue
+                        else:
+                            if length - length_mill < 40 or width - width_mill < 40:
+                                continue
+                    elif case == "Intersection Mill-Drill Mill-Slant" or case == "Intersection Mill-Drill Mill-Slant Drill-Slant":
+                        space_available = False
+                        for i in range(length_mill - 14 + 1):
+                            for j in range(width_mill - 14 + 1):
+                                if occupancy_drilling.is_free(rectification_x + i, rectification_x + i + 14, rectification_y + j, rectification_y + j + 14):
+                                    space_available = True
+                                    break
+                            if space_available:
+                                break
+                        if not space_available:
+                            continue
+
+                    x_mill = - length/2 + length_mill/2 + rectification_x
+                    y_mill = - width/2 + width_mill/2 + rectification_y
+
+                    i_start_mill = rectification_x
+                    i_end_mill = rectification_x + length_mill
+                    j_start_mill = rectification_y
+                    j_end_mill = rectification_y + width_mill
+
+                    if occupancy_milling.is_free(i_start_mill, i_end_mill, j_start_mill, j_end_mill):
+                        max_depth = int(0.5 * height)
+                        min_depth = 10
+                        if "depth_drill" in locals():
+                            if np.max(occupancy_depth.grid[i_start_mill+3:i_end_mill-3, j_start_mill+3:j_end_mill-3]) == depth_drill:
+                                max_depth = depth_drill - 10
+                        if occupancy_slant.is_not_free(i_start_mill, i_end_mill, j_start_mill, j_end_mill):
+                            depth_grid = occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill]
+                            min_depth = max(np.max(depth_grid[depth_grid <= height_slant]) - 5, 10)
+                        depth_mill = random.randint(min_depth, max_depth) # lower range: 10 - (height_slant-5) upper range: (height_slant-5) - (height-10)
+
+                        # Create a drill inside the milling feature
+                        while True: # Iterate over the dimensions to find a suitable location for the drill inside the milling feature
+                            diameter_drill_next = random.randint(8, min(24, int(0.5*min(length_mill, width_mill)))) # lower range: 8 upper range: 15 - 24
+                            length_drill_next = diameter_drill_next + 6
+                            width_drill_next = diameter_drill_next + 6
+                            rectification_x_drill_next = random.randint(i_start_mill, i_end_mill - length_drill_next)
+                            rectification_y_drill_next = random.randint(j_start_mill, j_end_mill - width_drill_next)
+
+                            x_drill_next = - length/2 + length_drill_next/2 + rectification_x_drill_next
+                            y_drill_next = - width/2 + width_drill_next/2 + rectification_y_drill_next
+
+                            i_start_drill_next = rectification_x_drill_next
+                            i_end_drill_next = rectification_x_drill_next + length_drill_next
+                            j_start_drill_next = rectification_y_drill_next
+                            j_end_drill_next = rectification_y_drill_next + width_drill_next
+
+                            if occupancy_drilling.is_free(i_start_drill_next, i_end_drill_next, j_start_drill_next, j_end_drill_next):
+                                depth_drill_next = random.randint(depth_mill + 10, height) # lower range: 20 - 50 upper range: 50 - 80
+                                volume_drill_next = 0.25 * np.pi * diameter_drill_next * diameter_drill_next * depth_drill_next
+                                occupancy_drilling.grid[i_start_drill_next:i_end_drill_next, j_start_drill_next:j_end_drill_next] = True
+                                occupancy_depth.grid[i_start_drill_next+3:i_end_drill_next-3, j_start_drill_next+3:j_end_drill_next-3] = depth_drill_next
+                                drill_list.append((DRILL_IDX, (diameter_drill_next, depth_drill_next, x_drill_next, y_drill_next), volume_drill_next))
+                                D -= 1
+                                break
+
+                        # Continue with the nesting milling feature
+                        volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill], a_min=0, a_max=depth_mill))
+                        mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                        occupancy_milling.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill] = True
+                        occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill] = np.clip(occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill], a_min=depth_mill, a_max=None)
+                        M -= 1
+                        flag_mill_2 = True
+                        break
+                
+                # Place nested milling feature (flag_mill_3)
+                if (M > 0 and create_first_type_first) or (M > 1 and not create_first_type_first):
+                    while True: # Iterate over the dimensions to make the nested fature smaller than the nesting feature
+                        length_mill_next = random.randint(diameter_drill_next + 5, length_mill) # lower range: 15 - 32 upper range: 100 - 128
+                        width_mill_next = random.randint(diameter_drill_next + 5, width_mill) # lower range: 15 - 32 upper range: 100 - 128
+                        if length_mill_next <= length_mill - 10 or width_mill_next < width_mill - 10:
+                            break
+                    rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                    rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+                    x_mill_next = - length/2 + length_mill_next/2 + rectification_x_next
+                    y_mill_next = - width/2 + width_mill_next/2 + rectification_y_next
+
+                    i_start_mill_next = rectification_x_next
+                    i_end_mill_next = rectification_x_next + length_mill_next
+                    j_start_mill_next = rectification_y_next
+                    j_end_mill_next = rectification_y_next + width_mill_next
+
+                    max_depth = height - 5
+                    min_depth = depth_mill + 5
+                    depth_grid = occupancy_depth.grid[i_start_mill_next+3:i_end_mill_next-3, j_start_mill_next+3:j_end_mill_next-3]
+                    if "depth_drill" in locals() and"depth_drill_next" in locals():
+                        check_drill_1 = np.any(depth_grid[depth_grid > depth_mill] == depth_drill)
+                        check_drill_2 = np.any(depth_grid[depth_grid > depth_mill] == depth_drill_next)
+                        if check_drill_1 and check_drill_2:
+                            max_depth = min(depth_drill, depth_drill_next) - 5
+                        elif check_drill_1 or check_drill_2:
+                            max_depth = check_drill_1 * depth_drill + check_drill_2 * depth_drill_next - 5
+                    elif "depth_drill" in locals():
+                        if np.max(depth_grid) == depth_drill:
+                            max_depth = depth_drill - 5
+                    elif "depth_drill_next" in locals():
+                        if np.max(depth_grid) == depth_drill_next:
+                            max_depth = depth_drill_next - 5
+                    depth_mill_next = random.randint(min_depth, max_depth) # lower range: 15 - (depth_mill + 5) upper range: (depth_mill + 5) - 75
+                    volume_mill_next = length_mill_next * width_mill_next * depth_mill_next - np.sum(np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=depth_mill, a_max=depth_mill_next))
+
+                    mill_list.append((MILL_IDX, (length_mill_next, width_mill_next, depth_mill_next, x_mill_next, y_mill_next), volume_mill_next))
+                    occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=depth_mill_next, a_max=None)
+                    M -= 1
+                    flag_mill_3 = True
+
+                # Place abut milling feature (the nesting feature serve as the base feature to this abut feature)
+                if M > 0:
+                    # Iterate over the coordinates and dimensions to find a suitable location for the abut feature (next to the nesting feature)
+                    while True:
+                        direction = random.choice(['left', 'right', 'top', 'bottom'])
+                        if direction == 'left':
+                            length_mill_next = random.randint(15, int(0.65 * length_mill))
+                            width_mill_next = random.randint(15, int(0.65 * width_mill))
+                            rectification_x_next = rectification_x - length_mill_next
+                            rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+
+                        elif direction == 'right':
+                            length_mill_next = random.randint(15, int(0.65 * length_mill))
+                            width_mill_next = random.randint(15, int(0.65 * width_mill))
+                            rectification_x_next = rectification_x + length_mill
+                            rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+
+                        elif direction == 'top':
+                            length_mill_next = random.randint(15, int(0.65 * length_mill))
+                            width_mill_next = random.randint(15, int(0.65 * width_mill))
+                            rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                            rectification_y_next = rectification_y + width_mill
+
+                        elif direction == 'bottom':
+                            length_mill_next = random.randint(15, int(0.65 * length_mill))
+                            width_mill_next = random.randint(15, int(0.65 * width_mill))
+                            rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                            rectification_y_next = rectification_y - width_mill_next
+                            
+                        x_mill_next = - length/2 + length_mill_next/2 + rectification_x_next
+                        y_mill_next = - width/2 + width_mill_next/2 + rectification_y_next
+
+                        i_start_mill_next = rectification_x_next
+                        if i_start_mill_next < 0 or i_start_mill_next in range(1, 5):  # Prevent from creating thin edges
+                            continue
+                        i_end_mill_next = rectification_x_next + length_mill_next
+                        if i_end_mill_next > length or i_end_mill_next in range(length - 5, length):  # Prevent from creating thin edges
+                            continue
+                        j_start_mill_next = rectification_y_next
+                        if j_start_mill_next < 0 or j_start_mill_next in range(1, 5):  # Prevent from creating thin edges
+                            continue
+                        j_end_mill_next = rectification_y_next + width_mill_next
+                        if j_end_mill_next > width or j_end_mill_next in range(width - 5, width):  # Prevent from creating thin edges
+                            continue
+
+                        if occupancy_milling.is_free(i_start_mill_next, i_end_mill_next, j_start_mill_next, j_end_mill_next):
+                            depth_mill_next = random.randint(5, depth_mill - 5) # lower range: 5 upper range: 5 - 65
+                            # If the slant overlaps with the abut feature, look for another location
+                            if depth_mill_next < np.max(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next]):
+                                continue
+                            volume_mill_next = length_mill_next * width_mill_next * depth_mill_next - np.sum(np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=0, a_max=depth_mill_next))
+                            mill_list.append((MILL_IDX, (length_mill_next, width_mill_next, depth_mill_next, x_mill_next, y_mill_next), volume_mill_next))
+                            occupancy_milling.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = True
+                            occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=depth_mill_next, a_max=None)
+                            M -= 1
+                            flag_mill_4 = True
+                            if flag_mill_3 and flag_mill_4:
+                                mill_list[-2:] = sorted(mill_list[-2:], key=lambda x: x[2], reverse=True)
+                            break
+            
+            # Place the drill features
+            for drill_number in range(D):
+                #Check if there is available space for a minimum size drill
+                space_available = False
+                for i in range(length- 14 + 1):
+                    for j in range(width- 14 +1):
+                        if occupancy_drilling.is_free(i, i+14, j, j+14):
+                            space_available = True
+                            break
+                    if space_available:
+                        break
+                if not space_available:
+                    if drill_number == 0:
+                        print("No space available for the drill")
+                        print(f'Update Sample {sample}: Combination: {combinations[1][0]}, Case: {combinations[1][1]}')
+                    break
+
+                # Iterate over the coordinates and dimensions to find a suitable location for the drill
+                while True:
+                    diameter_drill = random.randint(8, 24)
+                    length_drill = diameter_drill + 6
+                    width_drill = diameter_drill + 6
+                    rectification_x = random.randint(0, length - length_drill)
+                    rectification_y = random.randint(0, width - width_drill)
+                    x_drill = - length/2 + length_drill/2 + rectification_x
+                    y_drill = - width/2 + width_drill/2 + rectification_y
+
+                    i_start_drill = rectification_x
+                    i_end_drill = rectification_x + length_drill
+                    j_start_drill = rectification_y
+                    j_end_drill = rectification_y + width_drill
+
+                    if occupancy_drilling.is_free(i_start_drill, i_end_drill, j_start_drill, j_end_drill):
+                        min_depth = max(np.max(occupancy_depth.grid[i_start_drill:i_end_drill, j_start_drill:j_end_drill]) + 5, 10)
+                        if min_depth > height:
+                            continue
+                        depth_drill = random.randint(min_depth, height) # lower range: 10 - height upper range: heigth
+                        volume_drill = 0.25 * np.pi * diameter_drill * diameter_drill * depth_drill
+                        drill_list.append((DRILL_IDX, (diameter_drill, depth_drill, x_drill, y_drill), volume_drill))
+                        occupancy_drilling.grid[i_start_drill:i_end_drill, j_start_drill:j_end_drill] = True
+                        occupancy_depth.grid[i_start_drill+3:i_end_drill-3, j_start_drill+3:j_end_drill-3] = depth_drill
+                        break
+
+            drill_list.sort(key=lambda x: x[2], reverse=True)
+            feature_list.extend(drill_list)
+
+        # Place the milling features not placed in the previous operations
+        if operation == MILL_IDX:
+
+            # Place the nesting milling feature
+            if not flag_mill_2 and M > 0:
+                # Iterate over the coordinates to find a suitable location for the milling feature
+                while True:
+                    length_mill = random.randint(30, int(0.7*length))
+                    width_mill = random.randint(30, int(0.7*width))
+                    # Leave space for the other milling features
+                    if  case in ["No Intersection", "Intersection Drill-Slant"] and (M > 2 or (M == 2 and not create_first_type_first)):
+                        if len(slant_list) > 0:
+                            if M == 2:
+                                if (slant_list[0][1][0] in ["left", "right"] and (length - length_mill - slant_list[0][1][1] < 40) and (width - width_mill < 40)) or \
+                                    (slant_list[0][1][0] in ["top", "bottom"] and (width - width_mill - slant_list[0][1][1] < 40) and (length - length_mill < 40)):
+                                    continue
+                            if M > 2:
+                                if (slant_list[0][1][0] in ["left", "right"] and ((length - length_mill - slant_list[0][1][1] < 40) or (width - width_mill < 40))) or \
+                                    (slant_list[0][1][0] in ["top", "bottom"] and ((width - width_mill - slant_list[0][1][1] < 40) or (length - length_mill < 40))):
+                                    continue
+                        else:
+                            if M == 2:
+                                if length - length_mill < 40 and width - width_mill < 40:
+                                    continue
+                            if M > 2:
+                                if length - length_mill < 40 or width - width_mill < 40:
+                                    continue
+
+                    rectification_x = random.choice([0, length - length_mill, *range(5, length - length_mill - 5 + 1)]) # Prevent from creating thin edges
+                    rectification_y = random.choice([0, width - width_mill, *range(5, width - width_mill - 5 + 1)]) # Prevent from creating thin edges
+                    x_mill = - length/2 + length_mill/2 + rectification_x
+                    y_mill = - width/2 + width_mill/2 + rectification_y
+
+                    i_start_mill = rectification_x
+                    i_end_mill = rectification_x + length_mill
+                    j_start_mill = rectification_y
+                    j_end_mill = rectification_y + width_mill
+
+                    if occupancy_milling.is_free(i_start_mill, i_end_mill, j_start_mill, j_end_mill):
+                        if occupancy_slant.is_not_free(i_start_mill, i_end_mill, j_start_mill, j_end_mill):
+                            min_depth = np.max(occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill]) - 5
+                        else: min_depth = 15
+                        depth_mill = random.randint(max(min_depth, 15), max(min_depth, int(0.5*height)))
+                        volume_mill = length_mill * width_mill * depth_mill - np.sum(np.clip(occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill], a_min=0, a_max=depth_mill))
+                        occupancy_drilling.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill] = True
+                        occupancy_milling.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill] = True
+                        occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill] = np.clip(occupancy_depth.grid[i_start_mill:i_end_mill, j_start_mill:j_end_mill], a_min=depth_mill, a_max=None)
+                        mill_list.append((MILL_IDX, (length_mill, width_mill, depth_mill, x_mill, y_mill), volume_mill))
+                        M -= 1
+                        flag_mill_2 = True
+                        break
+            
+            # Place the nested milling feature
+            if not flag_mill_3 and ((M > 0 and create_first_type_first) or (M > 1 and not create_first_type_first)):
+                # Iterate over the dimensions to make the nested feature smaller than the nesting feature
+                while True:
+                    length_mill_next = random.randint(15, length_mill)
+                    width_mill_next = random.randint(15, width_mill)
+                    if length_mill_next < length_mill - 5 or width_mill_next < width_mill - 5:
+                        break
+                rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+                x_mill_next = - length/2 + length_mill_next/2 + rectification_x_next
+                y_mill_next = - width/2 + width_mill_next/2 + rectification_y_next
+
+                i_start_mill_next = rectification_x_next
+                i_end_mill_next = rectification_x_next + length_mill_next
+                j_start_mill_next = rectification_y_next
+                j_end_mill_next = rectification_y_next + width_mill_next
+
+                depth_mill_next = random.randint(depth_mill + 5, min(depth_mill + 5 + int(0.3*height), height))
+                volume_mill_next = length_mill_next * width_mill_next * depth_mill_next - np.sum(np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=depth_mill, a_max=depth_mill_next))
+                occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=depth_mill_next, a_max=None)
+
+                mill_list.append((MILL_IDX, (length_mill_next, width_mill_next, depth_mill_next, x_mill_next, y_mill_next), volume_mill_next))
+                M -= 1
+                flag_mill_3 = True
+
+            # Place the abut milling feature
+            if not flag_mill_4 and M > 0:
+                # Iterate over the coordinates and dimensions to find a suitable location for the abut feature
+                while True:
+                    direction = random.choice(['left', 'right', 'top', 'bottom'])
+                    if direction == 'left':
+                        length_mill_next = random.randint(15, int(0.65 * length_mill))
+                        width_mill_next = random.randint(15, int(0.65 * width_mill))
+                        rectification_x_next = rectification_x - length_mill_next
+                        rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+
+                    elif direction == 'right':
+                        length_mill_next = random.randint(15, int(0.65 * length_mill))
+                        width_mill_next = random.randint(15, int(0.65 * width_mill))
+                        rectification_x_next = rectification_x + length_mill
+                        rectification_y_next = random.randint(rectification_y, rectification_y + width_mill - width_mill_next)
+
+                    elif direction == 'top':
+                        length_mill_next = random.randint(15, int(0.65 * length_mill))
+                        width_mill_next = random.randint(15, int(0.65 * width_mill))
+                        rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                        rectification_y_next = rectification_y + width_mill
+
+                    elif direction == 'bottom':
+                        length_mill_next = random.randint(15, int(0.65 * length_mill))
+                        width_mill_next = random.randint(15, int(0.65 * width_mill))
+                        rectification_x_next = random.randint(rectification_x, rectification_x + length_mill - length_mill_next)
+                        rectification_y_next = rectification_y - width_mill_next
+                        
+                    x_mill_next = - length/2 + length_mill_next/2 + rectification_x_next
+                    y_mill_next = - width/2 + width_mill_next/2 + rectification_y_next
+
+                    i_start_mill_next = rectification_x_next
+                    if i_start_mill_next < 0 or i_start_mill_next in range(1, 5):  # Prevent from creating thin edges
+                        continue
+                    i_end_mill_next = rectification_x_next + length_mill_next
+                    if i_end_mill_next > length or i_end_mill_next in range(length - 5, length):  # Prevent from creating thin edges
+                        continue
+                    j_start_mill_next = rectification_y_next    
+                    if j_start_mill_next < 0 or j_start_mill_next in range(1, 5):  # Prevent from creating thin edges
+                        continue
+                    j_end_mill_next = rectification_y_next + width_mill_next
+                    if j_end_mill_next > width or j_end_mill_next in range(width - 5, width):  # Prevent from creating thin edges
+                        continue
+
+                    if occupancy_milling.is_free(i_start_mill_next, i_end_mill_next, j_start_mill_next, j_end_mill_next):
+                        depth_mill_next = random.randint(5, depth_mill - 5)
+                        # If the slant overlaps with the abut feature, look for another location
+                        if depth_mill_next < np.max(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next]): 
+                            continue
+                        occupancy_drilling.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = True
+                        occupancy_milling.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = True
+                        volume_mill_next = length_mill_next * width_mill_next * depth_mill_next - np.sum(np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=0, a_max=depth_mill_next))
+                        mill_list.append((MILL_IDX, (length_mill_next, width_mill_next, depth_mill_next, x_mill_next, y_mill_next), volume_mill_next))
+                        M -= 1
+                        flag_mill_4 = True
+                        if flag_mill_3 and flag_mill_4:
+                            mill_list[-2:] = sorted(mill_list[-2:], key=lambda x: x[2], reverse=True)
+                        break
+            
+            if not flag_mill_1 and M > 0:
+                # Iterate over the coordinates and dimensions to find a suitable location for the milling feature
+                while True:
+                    length_mill_next = random.randint(15, int(0.5 * length))
+                    width_mill_next = random.randint(15, int(0.5 * width))
+                    rectification_x_next = random.choice([0, length - length_mill_next, *range(5, length - length_mill_next - 5 + 1)]) # Prevent from creating thin edges
+                    rectification_y_next = random.choice([0, width - width_mill_next, *range(5, width - width_mill_next - 5 + 1)]) # Prevent from creating thin edges
+                    x_mill_next = - length/2 + length_mill_next/2 + rectification_x_next
+                    y_mill_next = - width/2 + width_mill_next/2 + rectification_y_next
+
+                    i_start_mill_next = rectification_x_next
+                    i_end_mill_next = rectification_x_next + length_mill_next
+                    j_start_mill_next = rectification_y_next
+                    j_end_mill_next = rectification_y_next + width_mill_next
+
+                    if occupancy_milling.is_free(max(i_start_mill_next - 5, 0), min(i_end_mill_next +5, length), max(j_start_mill_next - 5, 0), min(j_end_mill_next + 5, width)):
+                        occupancy_drilling.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = True
+                        occupancy_milling.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next] = True
+                        max_depth = np.max(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next])
+                        if max_depth == 0:
+                            depth_mill_next = random.randint(15, height)
+                        else:
+                            depth_mill_next = max_depth - 5
+                        volume_mill_next = length_mill_next * width_mill_next * depth_mill_next - np.sum(np.clip(occupancy_depth.grid[i_start_mill_next:i_end_mill_next, j_start_mill_next:j_end_mill_next], a_min=0, a_max=depth_mill_next))
+                        mill_list.insert(0, (MILL_IDX, (length_mill_next, width_mill_next, depth_mill_next, x_mill_next, y_mill_next), volume_mill_next))
+                        M -= 1
+                        flag_mill_1 = True
+                        break
+
+            if flag_mill_1:
+                if mill_list[0][2] <= mill_list[1][2]:
+                    mill_list.append(mill_list.pop(0))
+
+            feature_list.extend(mill_list)
+
+                
+    # Clear unnecessary variables
+    del occupancy_drilling, occupancy_milling, occupancy_slant, occupancy_depth
+    del slant_list, mill_list, drill_list
+    del flag_mill_1, flag_mill_2, flag_mill_3, flag_mill_4
+    del D, M, combination, case
+    gc.collect()
+
+    # Create the features in the part and save the STL files and h5 files with the voxelized data
+    for i, feature in enumerate(feature_list):
+        part.create_feature(feature[0], *feature[1])
+        stl_file_path = get_next_stl_filename(stl_file_path)
+        part.save_as_stl(stl_file_path)
+        voxelizer.convert_to_voxels(stl_file_path)
+        voxelizer.compute_delta_volume(operation=feature[0])
+
+        if i == len(feature_list) - 1:
+            part.close_document()
+            del part
+            gc.collect()
+            # Augment the voxelized data (with 5 possible rotations) and save the h5 files
+            repeat_sample = voxelizer.finalize(augmentation=True, base_h5_dir=base_h5_dir, base_stl_dir=base_stl_dir)
+            if not repeat_sample:
+                # Save the information of the sample in the csv file and update the sample number
+                csv_writer.writerow({
+                    'sample': sample,
+                    'folder': h5_file_path.split('\\')[-2],
+                    'filename': h5_file_path.split('\\')[-1].split('.')[0],
+                    'combination': ','.join([str(f) for f in list(OrderedDict.fromkeys([f[0] for f in feature_list]))]),
+                    'num_mill': len([f for f in feature_list if f[0] == MILL_IDX]),
+                    'num_drill': len([f for f in feature_list if f[0] == DRILL_IDX]),
+                    'num_slant': len([f for f in feature_list if f[0] == SLANT_IDX])
+                })
+                sample += 1
+
+    gc.collect()
+            
+
+
+if __name__ == "__main__":    
+    
+    # Enable debugging
+    # ptvsd.enable_attach(address=('localhost', 5678))
+    # ptvsd.wait_for_attach()
+    
+    # Create the data
+    num_samples = 180000
+    sample = 1
+    csv_file_path = 'C:/Users/jgomez310/Documents/data_deepms/dataset_info.csv'
+    fieldnames = ['sample', 'folder', 'filename', 'combination', 'num_mill', 'num_drill', 'num_slant']
+
+    # Open the csv file and iterate over the samples
+    with open(csv_file_path, 'a', newline='') as csvfile:
+        csv_writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+        if sample == 1:
+            csv_writer.writeheader()
+            
+        while sample <= num_samples:
+            print(f"Generating sample {sample} of {num_samples}")
+            main(csv_writer)
+            print(f"Finished generating sample {sample - 1}")
+            
+            if (sample - 1) % 100 == 0:
+                csvfile.flush()

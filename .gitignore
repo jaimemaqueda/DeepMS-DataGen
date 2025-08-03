@@ -1,0 +1,42 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Binvox executable
+bin/binvox
+bin/binvox.exe
+
+# Output data directories
+/seq_h5/
+/seq_stl/
+/data/
+*.csv
+*.h5
+*.stl
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.idea/
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*~

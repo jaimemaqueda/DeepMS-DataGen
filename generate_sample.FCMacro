@@ -1,0 +1,90 @@
+import numpy as np
+from scripts import PartCreator, VoxelConverter
+from scripts.utils import get_next_filenames, get_next_stl_filename
+from scripts.macro import *
+
+
+def main():
+
+    # Obtain the next file paths for the HDF5 and STL files
+    base_h5_dir = 'C:/Users/jgomez310/Documents/data_deepms'
+    base_stl_dir = 'C:/Users/jgomez310/Documents/data_deepms'
+    h5_file_path, stl_file_path = get_next_filenames(base_h5_dir, base_stl_dir, max_files_per_folder=3000)
+
+    # Initialize the PartCreator with the current document
+    part = PartCreator()
+
+    # Create a prismatic raw stock
+    part.create_raw_stock(length=128, width=120, height=120)
+
+    # Save the raw_stock as an STL file
+    part.save_as_stl(stl_file_path)
+
+    # Initialize the VoxelConverter with the current document
+    converter = VoxelConverter(filename=h5_file_path, stl_filename=stl_file_path)
+    converter.convert_to_voxels(stl_file_path, operation=RS_IDX)
+
+    # Create a pocket
+    part.create_mill_feature(length=50.0, width=40.0, depth=5.0, x=0.0, y=0.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=MILL_IDX)
+
+    # Create a pocket
+    part.create_mill_feature(length=20.0, width=20.0, depth=20.0, x=0.0, y=0.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=MILL_IDX)
+
+    # Create a pocket
+    part.create_mill_feature(length=10.0, width=80.0, depth=30.0, x=17.5, y=0.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=MILL_IDX)
+
+    # Create a hole
+    part.create_drill_feature(diameter=10.0, depth=40.0, x=-35.0, y=30.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=DRILL_IDX)
+
+    # Create a hole
+    part.create_drill_feature(diameter=10.0, depth=30.0, x=-35.0, y=10.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=DRILL_IDX)
+
+    # Create a hole
+    part.create_drill_feature(diameter=10.0, depth=20.0, x=-35.0, y=-10.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=DRILL_IDX)
+
+    # Create a hole
+    part.create_drill_feature(diameter=10.0, depth=10.0, x=-35.0, y=-30.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=DRILL_IDX)
+
+    # Create a chamfer
+    part.create_slant_feature(direction='bottom', size_slant=5.0, height_slant=10.0)
+    stl_file_path = get_next_stl_filename(stl_file_path)
+    part.save_as_stl(stl_file_path)
+    converter.convert_to_voxels(stl_file_path)
+    converter.compute_delta_volume(operation=SLANT_IDX)
+
+    # Save the sequence to an HDF5 file
+    converter.finalize()
+
+    part.close_document()
+
+
+if __name__ == "__main__":
+    main()
