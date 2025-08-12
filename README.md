@@ -78,9 +78,23 @@ To run the `generate_data.FCMacro`, you need:
 
 The dataset is not included in this repository; it will be generated when you run the macro in your specified output directories. Due to the large volume of data (potentially over 1.08 million samples), ensure you have sufficient disk space available in your chosen location.
 
-## Contributing
+## Citation
 
-Contributions to enhance the functionality or expand the dataset generation process are welcome. Please feel free to open an issue or submit a pull request.
+Please cite our work if you find it useful:
+
+```bibtex
+@article{MAQUEDA2025947,
+  title = {DeepMS: A data-driven approach to machining process sequencing using transformers},
+  journal = {Journal of Manufacturing Systems},
+  volume = {82},
+  pages = {947-963},
+  year = {2025},
+  issn = {0278-6125},
+  doi = {https://doi.org/10.1016/j.jmsy.2025.07.022},
+  url = {https://www.sciencedirect.com/science/article/pii/S0278612525001979},
+  author = {Jaime Maqueda and David W. Rosen and Shreyes N. Melkote}
+}
+```
 
 ## License
 
